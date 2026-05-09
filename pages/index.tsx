@@ -21,30 +21,36 @@ function rrr(need:number,ov:number){return ov<=0?'∞':(need/ov).toFixed(2)}
 type Team={id:string;name:string;short_name:string;color:string}
 type Player={id:string;team_id:string;name:string;role:string;is_captain:boolean;is_keeper:boolean;is_substitute:boolean}
 type Match={id:string;label:string;team1_id:string;team2_id:string;match_date:string|null;overs:number;status:string;toss_winner_id:string|null;toss_choice:string|null;batting_first_id:string|null;current_innings:number;inn1_runs:number;inn1_wickets:number;inn1_overs:number;inn1_balls:number;inn2_runs:number;inn2_wickets:number;inn2_overs:number;inn2_balls:number;winner_id:string|null;win_margin:string|null;team1?:Team;team2?:Team}
-type Ball={id:string;match_id:string;innings:number;over_number:number;ball_number:number;batsman_id:string|null;bowler_id:string|null;runs:number;is_wicket:boolean;dismissal_type:string|null;dismissed_player_id:string|null;extra_type:string|null;extra_runs:number;total_runs:number;batsman?:Player;bowler?:Player}
+type Ball={id:string;match_id:string;innings:number;over_number:number;ball_number:number;batsman_id:string|null;bowler_id:string|null;runs:number;is_wicket:boolean;dismissal_type:string|null;dismissed_player_id:string|null;extra_type:string|null;extra_runs:number;total_runs:number}
 
 export default function Home() {
   const [matches, setMatches] = useState<Match[]>([])
   const [teams, setTeams] = useState<Team[]>([])
-  const [tab, setTab] = useState<'live'|'fixtures'|'standings'|'teams'>('live')
+  const [tab, setTab] = useState<'live'|'fixtures'|'standings'|'teams'|'stats'>('live')
   const [players, setPlayers] = useState<Player[]>([])
+  const [balls, setBalls] = useState<Ball[]>([])
   const [loading, setLoading] = useState(true)
 
   const load = useCallback(async () => {
-    const [{ data: m }, { data: t }, { data: p }] = await Promise.all([
+    const [{ data: m }, { data: t }, { data: p }, { data: b }] = await Promise.all([
       sb.from('matches').select('*, team1:team1_id(*), team2:team2_id(*)').order('created_at'),
       sb.from('teams').select('*').order('name'),
       sb.from('players').select('*').order('name'),
+      sb.from('balls').select('*'),
     ])
     setMatches((m||[]) as Match[])
     setTeams((t||[]) as Team[])
     setPlayers((p||[]) as Player[])
+    setBalls((b||[]) as Ball[])
     setLoading(false)
   }, [])
 
   useEffect(() => {
     load()
-    const ch = sb.channel('home').on('postgres_changes',{event:'*',schema:'public',table:'matches'},load).on('postgres_changes',{event:'*',schema:'public',table:'balls'},load).subscribe()
+    const ch = sb.channel('home')
+      .on('postgres_changes',{event:'*',schema:'public',table:'matches'},load)
+      .on('postgres_changes',{event:'*',schema:'public',table:'balls'},load)
+      .subscribe()
     return () => { sb.removeChannel(ch) }
   }, [load])
 
@@ -70,6 +76,58 @@ export default function Home() {
     return Object.values(map).map((r:any)=>({...r,nrr:r.of_>0&&r.oa>0?r.rf/r.of_-r.ra/r.oa:0})).sort((a:any,b:any)=>b.pts-a.pts||b.nrr-a.nrr)
   }
 
+  function battingStats() {
+    const map: Record<string,any> = {}
+    balls.forEach(b => {
+      if(!b.batsman_id) return
+      const pid = b.batsman_id
+      if(!map[pid]){
+        const p = players.find(x=>x.id===pid)
+        const t = teams.find(x=>x.id===p?.team_id)
+        map[pid]={name:p?.name||'Unknown',team:t?.name||'',teamColor:t?.color||'#888',runs:0,balls:0,fours:0,sixes:0,innings:new Set()}
+      }
+      map[pid].innings.add(b.match_id+'_'+b.innings)
+      if(!b.extra_type||b.extra_type==='bye'||b.extra_type==='legbye') map[pid].balls++
+      map[pid].runs += b.runs
+      if(b.runs===4) map[pid].fours++
+      if(b.runs===6) map[pid].sixes++
+    })
+    return Object.values(map)
+      .map((s:any)=>({...s,sr:s.balls>0?(s.runs/s.balls*100).toFixed(1):'0.0',innings:s.innings.size}))
+      .sort((a:any,b:any)=>b.runs-a.runs)
+      .slice(0,10)
+  }
+
+  function bowlingStats() {
+    const map: Record<string,any> = {}
+    balls.forEach(b => {
+      if(!b.bowler_id) return
+      const pid = b.bowler_id
+      if(!map[pid]){
+        const p = players.find(x=>x.id===pid)
+        const t = teams.find(x=>x.id===p?.team_id)
+        map[pid]={name:p?.name||'Unknown',team:t?.name||'',teamColor:t?.color||'#888',legalBalls:0,runs:0,wickets:0,matchWkts:{} as Record<string,any>}
+      }
+      if(!b.extra_type||b.extra_type==='bye'||b.extra_type==='legbye') map[pid].legalBalls++
+      map[pid].runs += b.total_runs
+      if(b.is_wicket){
+        map[pid].wickets++
+        const mk=b.match_id+'_'+b.innings
+        if(!map[pid].matchWkts[mk]) map[pid].matchWkts[mk]={w:0,r:0}
+        map[pid].matchWkts[mk].w++
+        map[pid].matchWkts[mk].r+=b.total_runs
+      }
+    })
+    return Object.values(map).map((s:any)=>{
+      const best=Object.values(s.matchWkts).reduce((acc:any,m:any)=>{
+        if(m.w>acc.w||(m.w===acc.w&&m.r<acc.r)) return m
+        return acc
+      },{w:0,r:0}) as any
+      const econ=s.legalBalls>0?(s.runs/(s.legalBalls/6)).toFixed(2):'0.00'
+      return {...s,overs:Math.floor(s.legalBalls/6),bl:s.legalBalls%6,econ,bestFigs:`${best.w}/${best.r}`}
+    }).sort((a:any,b:any)=>b.wickets-a.wickets||parseFloat(a.econ)-parseFloat(b.econ)).slice(0,10)
+  }
+
   const tabStyle = (t:string) => ({
     padding:'8px 16px',borderRadius:6,fontSize:13,fontWeight:500,cursor:'pointer',border:'none',
     background: tab===t?'rgba(29,158,117,0.2)':'transparent',
@@ -85,7 +143,6 @@ export default function Home() {
 
   return (
     <div style={{minHeight:'100vh',background:'#070d0a'}}>
-      {/* Header */}
       <div style={{background:'rgba(0,0,0,0.6)',borderBottom:'1px solid rgba(255,255,255,0.06)',position:'sticky',top:0,zIndex:50,backdropFilter:'blur(12px)'}}>
         <div style={{maxWidth:900,margin:'0 auto',padding:'12px 16px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
           <div style={{display:'flex',alignItems:'center',gap:10}}>
@@ -97,10 +154,12 @@ export default function Home() {
           </div>
           <Link href="/admin"><span style={G.ghost}>Admin →</span></Link>
         </div>
-        <div style={{maxWidth:900,margin:'0 auto',padding:'0 16px 8px',display:'flex',gap:2}}>
-          {(['live','fixtures','standings','teams'] as const).map(t=>(
+        <div style={{maxWidth:900,margin:'0 auto',padding:'0 16px 8px',display:'flex',gap:2,flexWrap:'wrap'}}>
+          {(['live','fixtures','standings','teams','stats'] as const).map(t=>(
             <button key={t} style={tabStyle(t)} onClick={()=>setTab(t)}>
-              {t==='live'?`🔴 Live${live.length?` (${live.length})`:''}`:`${t.charAt(0).toUpperCase()}${t.slice(1)}`}
+              {t==='live'?`🔴 Live${live.length?` (${live.length})`:''}`
+               :t==='stats'?'📊 Stats'
+               :`${t.charAt(0).toUpperCase()}${t.slice(1)}`}
             </button>
           ))}
         </div>
@@ -182,6 +241,84 @@ export default function Home() {
             {teams.length===0 && <div style={{textAlign:'center',color:'rgba(255,255,255,0.3)',padding:'60px 0'}}>No teams yet</div>}
           </div>
         )}
+
+        {!loading && tab==='stats' && (
+          <div>
+            {balls.length===0 ? (
+              <div style={{textAlign:'center',color:'rgba(255,255,255,0.3)',padding:'60px 0'}}>
+                <div style={{fontSize:40,marginBottom:12}}>📊</div>
+                Stats will appear once matches are played
+              </div>
+            ) : (
+              <div style={{display:'flex',flexDirection:'column',gap:24}}>
+                <div>
+                  <div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:24,letterSpacing:'0.05em',marginBottom:14}}>🏏 Top Run Scorers</div>
+                  <div style={{...G.card,padding:0,overflow:'hidden'}}>
+                    <table style={{width:'100%',borderCollapse:'collapse'}}>
+                      <thead><tr style={{borderBottom:'1px solid rgba(255,255,255,0.08)'}}>
+                        {['#','Player','Team','Inn','Runs','Balls','4s','6s','SR'].map(h=>(
+                          <th key={h} style={{padding:'10px 12px',fontSize:11,fontWeight:600,color:'rgba(255,255,255,0.4)',textAlign:h==='Player'||h==='Team'?'left':'center',textTransform:'uppercase',letterSpacing:'0.06em'}}>{h}</th>
+                        ))}
+                      </tr></thead>
+                      <tbody>
+                        {battingStats().map((p:any,i:number)=>(
+                          <tr key={i} style={{borderBottom:'1px solid rgba(255,255,255,0.04)'}}>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.4)',fontWeight:600}}>{i+1}</td>
+                            <td style={{padding:'11px 12px',fontWeight:600,fontSize:14}}>{p.name}</td>
+                            <td style={{padding:'11px 12px'}}>
+                              <span style={{fontSize:12,color:'rgba(255,255,255,0.5)',display:'inline-flex',alignItems:'center',gap:5}}>
+                                <span style={{width:8,height:8,borderRadius:'50%',background:p.teamColor,display:'inline-block'}}/>
+                                {p.team}
+                              </span>
+                            </td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.5)'}}>{p.innings}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:16,fontWeight:700,color:'#f0f4f2'}}>{p.runs}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.5)'}}>{p.balls}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'#378ADD'}}>{p.fours}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'#EF9F27'}}>{p.sixes}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.5)'}}>{p.sr}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div>
+                  <div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:24,letterSpacing:'0.05em',marginBottom:14}}>🎳 Top Wicket Takers</div>
+                  <div style={{...G.card,padding:0,overflow:'hidden'}}>
+                    <table style={{width:'100%',borderCollapse:'collapse'}}>
+                      <thead><tr style={{borderBottom:'1px solid rgba(255,255,255,0.08)'}}>
+                        {['#','Player','Team','Wkts','Overs','Runs','Econ','Best'].map(h=>(
+                          <th key={h} style={{padding:'10px 12px',fontSize:11,fontWeight:600,color:'rgba(255,255,255,0.4)',textAlign:h==='Player'||h==='Team'?'left':'center',textTransform:'uppercase',letterSpacing:'0.06em'}}>{h}</th>
+                        ))}
+                      </tr></thead>
+                      <tbody>
+                        {bowlingStats().map((p:any,i:number)=>(
+                          <tr key={i} style={{borderBottom:'1px solid rgba(255,255,255,0.04)'}}>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.4)',fontWeight:600}}>{i+1}</td>
+                            <td style={{padding:'11px 12px',fontWeight:600,fontSize:14}}>{p.name}</td>
+                            <td style={{padding:'11px 12px'}}>
+                              <span style={{fontSize:12,color:'rgba(255,255,255,0.5)',display:'inline-flex',alignItems:'center',gap:5}}>
+                                <span style={{width:8,height:8,borderRadius:'50%',background:p.teamColor,display:'inline-block'}}/>
+                                {p.team}
+                              </span>
+                            </td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:16,fontWeight:700,color:'#E24B4A'}}>{p.wickets}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.5)'}}>{fmtOv(p.overs,p.bl)}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:'rgba(255,255,255,0.5)'}}>{p.runs}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,color:parseFloat(p.econ)<7?'#1D9E75':'rgba(255,255,255,0.5)'}}>{p.econ}</td>
+                            <td style={{padding:'11px 12px',textAlign:'center',fontSize:13,fontWeight:600,color:'#FAC775'}}>{p.bestFigs}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -248,3 +385,4 @@ function MatchCard({match:m,badge}:{match:Match,badge:any}) {
     </Link>
   )
 }
+
